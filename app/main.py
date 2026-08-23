@@ -55,11 +55,9 @@ app.add_middleware(
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("/health")
 def home():
-    return {
-        "message": "Smart Farm Advisory API is running"
-    }
+    return {"status": "ok"}, 200
 
 
 @router.get("/soil-texture")
