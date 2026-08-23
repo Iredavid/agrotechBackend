@@ -54,11 +54,9 @@ app.add_middleware(
 
 router = APIRouter()
 
-
-@router.get("/health")
-def home():
-    return {"status": "ok"}, 200
-
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health():
+    return {"status": "healthy"}
 
 @router.get("/soil-texture")
 async def soilTexture(
