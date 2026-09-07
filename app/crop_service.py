@@ -1,26 +1,25 @@
 """
-app/crop_service.py  (v8 -- performance pass 2)
------------------------------------------------
-Same behavior/response shape as v7. Further speed-only changes:
+app/crop_service.py  (v9 -- cache soil lookups by location, split by TTL)
+--------------------------------------------------------------------------
+Same behavior/response shape as v8. This pass adds caching to the two
+Earth Engine soil calls, which were previously the only uncached lookups
+in this function (everything else -- geocode, rainfall -- already used
+`cached()`).
 
-  4. reverse_geocode_state() and get_rainfall_climatology_mm() each
-     opened a brand new httpx.AsyncClient() (and paid a fresh TLS
-     handshake) on every call. They now share one module-level,
-     connection-pooled client.
-  5. enrich_with_state_data() recomputed a normalized copy of the
-     entire state_lookup["state"] column from scratch for every crop
-     in top_crops, even though the table never changes between those
-     calls. That normalization is now computed once per request (and
-     cached across requests, since _state_lookup is static) and passed
-     in, instead of being recomputed per crop.
+Why split into two cached calls instead of one:
+  - Soil nutrients/pH change slowly -> safe to cache 30 days, same as
+    state/rainfall.
+  - SMAP soil moisture is explicitly a rolling 7-day window -> a 30-day
+    cache would silently serve stale moisture. It gets its own short TTL.
 
-v7 changes (still in effect, see previous docstring):
-  1. get_soil_moisture() runs via asyncio.to_thread instead of
-     blocking the event loop.
-  2. Soil moisture, weather forecast, reverse geocoding, and rainfall
-     climatology run concurrently with asyncio.gather.
-  3. Reverse-geocoded state and rainfall climatology are cached by
-     rounded (lat, lon).
+Why keyed by (lat, lon) only, not by user/farm ID:
+  These are properties of a PLACE, not a user -- two different farmers at
+  the same coordinates genuinely have the same soil pH and nutrient
+  levels. Keying by location is correct here, not a cross-user leak risk.
+  (Contrast with manual_soil_texture / irrigation_type below, which are
+  farmer-entered and are NOT cached -- they're recomputed fresh from
+  whatever farmData was just passed in, every call, which is already the
+  safe behavior for user-editable input.)
 """
 import re
 import os
@@ -35,6 +34,11 @@ from app.texture_options import validate_and_map_manual_texture
 from app.irrigation_options import validate_irrigation_type
 from app.irrigation_advisor import get_irrigation_advice
 from app.geo_cache import cached
+from app.test_earth_engine import (
+    get_soil_static_properties,
+    get_soil_dynamic_bands,
+    combine_soil_profile,
+)
 
 _ARTIFACT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,14 +55,16 @@ _state_lookup = pd.read_csv(os.path.join(
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 
-# State boundaries and rainfall climatology are effectively static.
-_STATE_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30      # 30 days
+# Static/slow-changing facts -- long TTL.
+_STATE_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30       # 30 days
 _RAINFALL_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30    # 30 days
+_SOIL_STATIC_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days (N/P/K, pH, carbon)
 
-# Shared, connection-pooled HTTP client instead of opening a new
-# httpx.AsyncClient() (and paying a fresh TLS handshake) on every
-# reverse-geocode / rainfall call. Same request semantics (params,
-# headers, timeout) -- just reused across calls.
+# Dynamic/fast-changing facts -- short TTL. SMAP's own query window is a
+# rolling 7 days; 6 hours keeps moisture reasonably fresh while still
+# absorbing repeated logins/refreshes within the same day.
+_SOIL_DYNAMIC_CACHE_TTL_SECONDS = 60 * 60 * 6      # 6 hours
+
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -104,8 +110,6 @@ def predict_top_crops(features: dict) -> list[dict]:
     return [{"crop": crop, "confidence": round(float(p) * 100, 1)} for crop, p in ranked]
 
 
-# Add any other naming variants you find in your CSV / geocoder output.
-# Keys and values should all be in "normalized" form (see _normalize).
 _STATE_ALIASES: dict[str, str] = {
     "federal capital territory": "fct",
     "federal capital territory fct": "fct",
@@ -115,9 +119,6 @@ _STATE_ALIASES: dict[str, str] = {
 
 
 def _normalize(name: str) -> str:
-    # lowercase, strip, collapse whitespace, drop punctuation like
-    # parentheses so "Federal Capital Territory (FCT)" and
-    # "federal capital territory" normalize to the same string
     name = name.strip().lower()
     name = re.sub(r"[^\w\s]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
@@ -129,12 +130,6 @@ def _resolve_state_key(name: str) -> str:
     return _STATE_ALIASES.get(normalized, normalized)
 
 
-# `_state_lookup["state"]` is a static, module-level table -- its
-# normalized form never changes across requests, let alone across the
-# crops within a single request. Previously enrich_with_state_data()
-# recomputed this normalization from scratch on every call (once per
-# crop in top_crops). It's now computed once, lazily, and reused --
-# same values, just not redone 5-10x per request.
 _normalized_state_lookup_col: "pd.Series | None" = None
 
 
@@ -167,18 +162,29 @@ async def get_crop_recommendation(
     lat: float,
     lon: float,
     farm_size_ha: float,
-    manual_soil_texture: str | None = None,   # e.g. "Sandy Clay Loam", optional
+    manual_soil_texture: str | None = None,
     irrigation_type: str | None = None,
 ) -> dict:
-    from app.test_earth_engine import get_soil_moisture
     from app.weather import forecast
 
     # --- Kick off every independent lookup at once ---------------------
-    # soil: blocking Earth Engine call -> runs on a worker thread so it
-    #   doesn't stall the event loop or block other requests.
-    # weather / state / rainfall: independent async HTTP calls.
-    soil_task = asyncio.to_thread(
-        get_soil_moisture, latitude=lat, longitude=lon)
+    # Soil is now TWO cached tasks instead of one uncached one:
+    #   - static: N/P/K, pH, organic carbon -> 30-day TTL, keyed by (lat, lon)
+    #   - dynamic: SMAP moisture/vegetation/water-balance -> 6-hour TTL,
+    #     keyed by (lat, lon)
+    # Both run on worker threads (asyncio.to_thread) since the underlying
+    # Earth Engine calls are blocking, same as before -- the only change
+    # is that a cache hit skips the blocking call entirely.
+    soil_static_task = cached(
+        prefix="soil_static", lat=lat, lon=lon,
+        fetch=lambda: asyncio.to_thread(get_soil_static_properties, lat, lon),
+        ttl_seconds=_SOIL_STATIC_CACHE_TTL_SECONDS,
+    )
+    soil_dynamic_task = cached(
+        prefix="soil_dynamic", lat=lat, lon=lon,
+        fetch=lambda: asyncio.to_thread(get_soil_dynamic_bands, lat, lon),
+        ttl_seconds=_SOIL_DYNAMIC_CACHE_TTL_SECONDS,
+    )
     weather_task = forecast(lat=lat, lon=lon)
     state_task = cached(
         prefix="state", lat=lat, lon=lon,
@@ -191,44 +197,51 @@ async def get_crop_recommendation(
         ttl_seconds=_RAINFALL_CACHE_TTL_SECONDS,
     )
 
-    soil, weather_forecast, state, rainfall_result = await asyncio.gather(
-        soil_task, weather_task, state_task, rainfall_task,
+    (
+        soil_static, soil_dynamic, weather_forecast, state, rainfall_result,
+    ) = await asyncio.gather(
+        soil_static_task, soil_dynamic_task, weather_task, state_task,
+        rainfall_task,
         return_exceptions=True,
     )
 
-    # soil and weather are load-bearing for the rest of this function --
-    # if either failed, raise so the caller gets a real error instead of
-    # a confusing downstream AttributeError.
-    if isinstance(soil, Exception):
-        raise soil
+    # Static soil properties and weather are load-bearing -- raise on failure.
+    if isinstance(soil_static, Exception):
+        raise soil_static
     if isinstance(weather_forecast, Exception):
         raise weather_forecast
 
-    # state is nice-to-have (only used for historical yield enrichment)
+    # Dynamic soil (moisture bands) degrades gracefully: farm_health_score
+    # and moisture-dependent fields become partial/None rather than the
+    # whole request failing, since crop prediction itself doesn't need them.
+    if isinstance(soil_dynamic, Exception):
+        soil_dynamic = {"success": False, "bands": {}}
+
     if isinstance(state, Exception):
         state = None
 
-    # rainfall falls back to summing the short-range forecast, same as
-    # the original try/except behavior
     if isinstance(rainfall_result, Exception):
         rainfall_mm = sum(item.get("rain", {}).get("3h", 0)
                           for item in weather_forecast.get("list", []))
     else:
         rainfall_mm = rainfall_result
 
-    current = weather_forecast["list"][0]["main"]
-    # auto_texture = soil.get("texture", {})
-    # auto_bucket = auto_texture.get("texture_class") or "Loamy"
+    soil = combine_soil_profile(soil_static, soil_dynamic)
 
-    texture_source = "satellite"
+    current = weather_forecast["list"][0]["main"]
+
     final_bucket = (
         validate_and_map_manual_texture(manual_soil_texture)
         if manual_soil_texture
         else "Loamy"
     )
+    # NOTE: manual_soil_texture / irrigation_type are farmer-entered and
+    # deliberately NOT part of any cache key above -- they're applied
+    # fresh here, every call, straight from whatever farmData was just
+    # passed in. If a farmer edits either field, the very next call
+    # reflects it immediately; there's no stale-cache path for these.
     texture_source = "farmer_input" if manual_soil_texture else "default"
 
-    # Irrigation type defaults to "none" (rain-fed) if the farmer hasn't set it
     validated_irrigation_type = validate_irrigation_type(
         irrigation_type or "none")
 
@@ -243,8 +256,6 @@ async def get_crop_recommendation(
         "soil_texture": final_bucket,
     }
 
-    # Pulled once for all crops -- these come from analyze_soil_condition's
-    # "bands" dict, already computed per farm on every get_soil_moisture() call
     bands = soil.get("bands", {})
     moisture_score_100 = bands.get("moisture_score_100")
     water_balance_score_100 = bands.get("watre_balance_100")

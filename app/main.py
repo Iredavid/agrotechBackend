@@ -1,15 +1,15 @@
 import asyncio
-
 from app.crop_service import get_crop_recommendation, reverse_geocode_state
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
-from app.firebase import addUserData, getUserData, get_state_list
+from app.firebase import addUserData, getUserData, get_state_list, updateserData
 from app.firebase import get_irrigation_options
 from app.texture_options import get_texture_options
+from app.fertilizer_service import get_fertilizer_recommendation
+from app.fertilizer_data import CROP_NPK_RATES
 from app.weather import forecast, geocode_state, get_weather
 from app.test_earth_engine import get_soil_texture_sync, initialize_earth_engine
-
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -26,6 +26,9 @@ class WeatherRequest(BaseModel):
 class addRequest(BaseModel):
     farmName: str
     farmData: Dict[str, Any]
+    userId: str
+class updateUserRequest(BaseModel):
+    data: Any
     userId: str
 
 
@@ -54,9 +57,11 @@ app.add_middleware(
 
 router = APIRouter()
 
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "healthy"}
+
 
 @router.get("/soil-texture")
 async def soilTexture(
@@ -100,10 +105,53 @@ async def crop_recommendation(request: CropRecommendationRequest):
             detail=f"Failed to generate crop recommendation: {str(error)}"
         )
 
+# router = APIRouter(prefix="/fertilizer", tags=["fertilizer"])
+
+
+class SoilFeatures(BaseModel):
+    N: float
+    P: float
+    K: float
+    ph: float
+    soil_texture: str | None = None
+    temperature: float | None = None
+    humidity: float | None = None
+    rainfall: float | None = None
+
+
+class FertilizerRequest(BaseModel):
+    crop: str
+    target_yield_t_ha: float
+    farm_size_ha: float
+    features: SoilFeatures
+
+
+@router.post("/recommendation")
+async def fertilizer_recommendation(payload: FertilizerRequest):
+    if payload.crop not in CROP_NPK_RATES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported crop '{payload.crop}'. "
+                f"Supported crops: {sorted(CROP_NPK_RATES)}"
+            ),
+        )
+    return await get_fertilizer_recommendation(
+        crop=payload.crop,
+        target_yield_t_ha=payload.target_yield_t_ha,
+        farm_size_ha=payload.farm_size_ha,
+        features=payload.features.model_dump(),
+    )
+
 
 @router.post("/addUser")
 def register_endpoint(request: addRequest):
     addUserData(request.farmData, request.userId, request.farmName)
+
+    
+@router.post("/updateUser")
+def register_endpoint(request: updateUserRequest):
+    updateserData(request.data, request.userId)
 
 
 @router.get("/getUserData")

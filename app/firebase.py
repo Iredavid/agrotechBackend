@@ -30,6 +30,19 @@ def addUserData(data, userId, farmName):
         )
 
 
+def updateserData(data, userId):
+    try:
+        db.collection("users").document(userId).set({
+            data
+        })
+        # return userId
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
 async def getUserData(userId):
     from app.crop_service import get_crop_recommendation
     try:
@@ -55,7 +68,7 @@ async def getUserData(userId):
             detail=str(error),
         )
 
-# 
+#
 
 # async def addStates():
 #     try:
@@ -68,6 +81,8 @@ async def getUserData(userId):
 #             status_code=500,
 #             detail=str(error),
 #         )
+
+
 def get_texture_options() -> list[dict]:
     try:
         doc_ref = db.collection("soil_texture_options").document(
@@ -86,6 +101,7 @@ def get_texture_options() -> list[dict]:
             status_code=500,
             detail=str(error),
         )
+
 
 def get_irrigation_options() -> list[dict]:
     try:
